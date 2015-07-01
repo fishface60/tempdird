@@ -1,0 +1,81 @@
+#!/usr/bin/python
+#Copyright (c) 2015, Richard Maw <richard.maw@gmail.com>
+#
+#Permission to use, copy, modify, and/or distribute this software for any
+#purpose with or without fee is hereby granted, provided that the above
+#copyright notice and this permission notice appear in all copies.
+#
+#THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+#WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+#MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+#ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+#WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+#ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+#OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+
+'''Run a subprocess with a tempdir
+
+Requests a tempdir from a 'name.maw.richard.tempd0' service, by talking to
+a D-Bus service specified by --bus-name and --bus-object-path, and starts
+a subprocess with the directory file descriptor still open on a file
+descriptor referred to by the environment variable specified by --fd-env-var,
+or replaces arguments equal to --fd-template.
+
+'''
+
+
+__version__ = (0, 0)
+
+
+import argparse
+import os
+import subprocess
+import sys
+
+import dbus
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--version', action='version',
+                    version='%(prog)s ' + '.'.join(map(str, __version__)))
+parser.add_argument('--bus-name', default='name.maw.richard.tempd0',
+                    help='Bus peer address to request tempdir from')
+parser.add_argument('--bus-object-path', default='/name/maw/richard/tempd',
+                    help='Object path of service in Bus peer')
+parser.add_argument('--dir-prefix', default=None, type=str,
+                    help='Prefix to name of tempdir to create')
+parser.add_argument('--dir-suffix', default=None, type=str,
+                    help='Suffix to name of tempdir to create')
+parser.add_argument('--fd-env-var', default='TEMPDIR_FD',
+                    help='Environment variable to store tempdir fd number in')
+parser.add_argument('--fd-template', default=None, type=str,
+                    help='Replace args equal to this with tempdir fd number')
+parser.add_argument('argv', nargs='+',
+                    help='Command to run with tempdir')
+
+options = parser.parse_args()
+
+bus = dbus.SessionBus()
+
+temp_manager = bus.get_object(options.bus_name,
+                              options.bus_object_path)
+tempd = dbus.Interface(temp_manager,
+                       dbus_interface='name.maw.richard.tempd0')
+
+temp_dir, fifo_write = tempd.make_tempdir(options.dir_suffix or "",
+                                          options.dir_prefix or "")
+temp_dir_fd, fifo_write_fd = temp_dir.take(), fifo_write.take()
+
+env = dict(os.environ)
+
+if options.fd_env_var:
+    env[options.fd_env_var] = str(temp_dir_fd)
+
+if options.fd_template is None:
+    argv = options.argv
+else:
+    argv = [str(temp_dir_fd) if arg == options.fd_template else arg
+            for arg in options.argv]
+
+sys.exit(subprocess.call(argv, env=env,
+                         preexec_fn=lambda: os.close(fifo_write_fd)))

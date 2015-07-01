@@ -1,0 +1,206 @@
+#!/usr/bin/python
+#Copyright (c) 2015, Richard Maw <richard.maw@gmail.com>
+#
+#Permission to use, copy, modify, and/or distribute this software for any
+#purpose with or without fee is hereby granted, provided that the above
+#copyright notice and this permission notice appear in all copies.
+#
+#THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+#WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+#MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+#ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+#WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+#ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+#OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+
+'''Start tempd d-bus daemon
+
+Registers a service with interface 'name.maw.richard.tempd0',
+which has method
+`make_tempdir(suffix:s, prefix:s) -> (temp_dir_fd:h, fifo_write_fd:h)`,
+which makes a temporary directory in --tempdir and return a reference to it.
+
+With well known name specified by --well-known-name
+at object path specified by --object-path.
+
+If multiple tempd daemons are running, they should have separate state
+dirs as specified with --rundir and --statedir.
+
+If %(prog)s is closed while a holder of a fifo_write_fd is still running,
+then when %(prog)s is restarted, it will resume waiting for the holder of
+the fifo_write_fd to close it.
+
+
+KNOWN BUG: If the holder closes it while %(prog)s is not running, then
+it will not be cleaned up.
+
+'''
+
+
+__version__ = (0, 0)
+
+
+import argparse
+from contextlib import contextmanager
+import shutil
+import logging
+import os
+from os import (O_DIRECTORY, O_RDONLY, O_WRONLY, O_RDWR, O_NDELAY,)
+O_CLOEXEC = 02000000
+import sys
+import tempfile
+
+import gobject
+from gobject import (IO_IN, IO_PRI, IO_ERR, IO_HUP,)
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+import xdg.BaseDirectory
+
+
+@contextmanager
+def close_fd(fd):
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
+class TempdirDispatch(object):
+
+    __slots__ = ('fifo_read_fd', 'temp_dir', 'fifo_path', 'event_id',)
+
+    def __init__(self, fifo_read_fd, temp_dir, fifo_path):
+        self.fifo_read_fd = fifo_read_fd
+        self.temp_dir = temp_dir
+        self.fifo_path = fifo_path
+
+    def on_read(self, read_fd, cb_condition, *args):
+        assert read_fd == self.fifo_read_fd
+        assert cb_condition == IO_IN or cb_condition == IO_HUP
+        if cb_condition == gobject.IO_IN:
+            out = ''.join(iter(lambda: os.read(read_fd, 4096), ''))
+            logging.error('Client wrote %s to pipe.', out)
+            return True
+
+        shutil.rmtree(self.temp_dir)
+        os.unlink(self.fifo_path)
+        os.close(read_fd)
+        return False
+
+
+def load_tempdir_dispatch(temp_dir_path, fifo_path):
+        fifo_read_fd = os.open(fifo_path, O_RDONLY|O_CLOEXEC|O_NDELAY)
+
+        dispatch = TempdirDispatch(fifo_read_fd=fifo_read_fd,
+                                   temp_dir=temp_dir_path,
+                                   fifo_path=fifo_path)
+        dispatch.event_id = gobject.io_add_watch(fifo_read_fd,
+                                                 IO_IN|IO_PRI|IO_ERR|IO_HUP,
+                                                 dispatch.on_read)
+
+
+class TempManager(dbus.service.Object):
+
+    def __init__(self, bus, object_path, temp_dir, state_dir, run_dir):
+        dbus.service.Object.__init__(self, bus, object_path)
+        self.temp_dir = temp_dir
+        self.state_dir = state_dir
+        self.run_dir = run_dir
+
+    @dbus.service.method(dbus_interface='name.maw.richard.tempd0',
+                         in_signature='ss', out_signature='hh')
+    def make_tempdir(self, suffix, prefix):
+        '''Make a temporary directory that is closed on process exit.
+
+        This takes suffix and prefix arguments, as passed to
+        `tempfile.mkdtemp`, makes the temporary directory, and returns
+        the directory file descriptor of the path, and a file descriptor
+        that when closed, either explicitly or on process terminate,
+        informs tempd that it may clean up the tempdir.
+
+        '''
+        td = tempfile.mkdtemp(suffix=suffix or '', prefix=prefix or 'tmp',
+                              dir=self.temp_dir)
+        try:
+            fifo_path = os.path.join(self.state_dir, os.path.basename(td))
+            os.mkfifo(fifo_path)
+            try:
+                load_tempdir_dispatch(temp_dir_path=td, fifo_path=fifo_path)
+
+                fifo_write_fd = os.open(fifo_path, O_WRONLY|O_CLOEXEC|O_NDELAY)
+
+                temp_dir_fd = os.open(td, O_DIRECTORY|O_RDONLY)
+                with close_fd(fifo_write_fd), close_fd(temp_dir_fd):
+                    return (dbus.types.UnixFd(temp_dir_fd),
+                            dbus.types.UnixFd(fifo_write_fd))
+            except:
+                os.unlink(fifo_path)
+        except:
+            shutil.rmtree(td)
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--version', action='version',
+                    version='%(prog)s ' + '.'.join(map(str, __version__)))
+parser.add_argument(
+        '--tempdir', default='/tmp',
+        help='Directory to create requested tempfiles in')
+parser.add_argument(
+        '--statedir', default=xdg.BaseDirectory.save_data_path('tempd'),
+        help='Directory to store local state in')
+default_rundir = os.path.join(
+        xdg.BaseDirectory.get_runtime_dir(strict=False), 'tempd')
+parser.add_argument(
+        '--rundir', default=default_rundir,
+        help='Directory to put runtime data in')
+parser.add_argument(
+        '--object-path', default='/name/maw/richard/tempd',
+        help='D-Bus object path to make service available at')
+parser.add_argument(
+        '--well-known-name', default='name.maw.richard.tempd0',
+        help='D-Bus well known name to make service available at')
+parser.add_argument(
+        '--no-well-known-name', action='store_const',
+        dest='well_known_name', const=None,
+        help='Do not register a well known name, see --inique-name-file')
+parser.add_argument(
+        '--unique-name-file', default=None,
+        help='Write unique name of peer to file')
+
+
+def main():
+    mainloop = gobject.MainLoop()
+    busloop = DBusGMainLoop()
+
+    options = parser.parse_args()
+
+    if not os.path.exists(options.rundir):
+        os.makedirs(options.rundir)
+
+    bus = dbus.SessionBus(mainloop=busloop)
+
+    if options.well_known_name:
+        name = dbus.service.BusName(options.well_known_name, bus)
+    if options.unique_name_file:
+        with open(options.unique_name_file, 'w') as f:
+            f.write(bus.get_unique_name() + '\n')
+            f.flush()
+
+    for existing_fifo_name in os.listdir(options.statedir):
+        temp_dir_path = os.path.join(options.tempdir, existing_fifo_name)
+        existing_fifo_path = os.path.join(options.statedir, existing_fifo_name)
+        load_tempdir_dispatch(temp_dir_path=temp_dir_path,
+                              fifo_path=existing_fifo_path)
+
+    manager = TempManager(bus=bus, object_path=options.object_path,
+                          temp_dir=options.tempdir,
+                          state_dir=options.statedir,
+                          run_dir=options.rundir)
+
+    mainloop.run()
+
+
+if __name__ == '__main__':
+    main()

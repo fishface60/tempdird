@@ -1,0 +1,21 @@
+Rationalise naming.
+
+Add a way to "deactivate" the cleanup on a tempdir, and move it elsewhere.
+
+Work out a good way to clean up tempdirs because we started after the
+peer with the fifo fd closed it. Use systemd's fdstore so the notification
+isn't lost because the read-end is closed, or lsof the fifo I guess.
+
+Sort out bus activation.
+
+Sort out the event loop such that we could exit on idle if there are no
+tempdirs we need to watch.
+
+Add support for connecting to arbitrary Buses, rather than just the
+session bus.
+
+Allow running as a system service and creating the tempdirs with
+appropriate permissions such that the peer is allowed to use it
+
+Port code to sd-bus, so there's porting difficulty should there be
+interest in moving this functionality into systemd.
